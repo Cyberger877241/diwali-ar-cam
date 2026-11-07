@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diwali Firework Cam</title>
+<link rel="stylesheet" href="../shared/base.css">
+<style>
+  @font-face {
+    font-family: "Diwali Script";
+    src: url("fonts/great-vibes-400.woff2") format("woff2");
+  }
+  @font-face {
+    font-family: "Diwali Display";
+    font-weight: 700;
+    src: url("fonts/playfair-display-700.woff2") format("woff2");
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<video class="source" autoplay muted playsinline></video>
+<canvas id="stage" class="layer"></canvas>
+<canvas id="text" class="layer"></canvas>
+<canvas id="hands" class="layer"></canvas>
+<div id="toast" class="badge"></div>
+<div id="rec" class="badge">● REC</div>
+<pre id="status"></pre>
+<div id="hint">waiting for camera…<br>allow access when the browser asks</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { createStage } from '../shared/stage.js';
+import { runCam, follow } from '../shared/app.js';
+import { fitToWindow, screenMapper, drawBones, drawLabel, handLength } from '../shared/hands.js';
+import { createFirework } from './firework.js';
+import { createTitle } from './title.js';
+
+// everything worth tweaking lives here
+const PARAMS = {
+
+  // world units. x = 0 is the launch column, which screenShift parks on
+  // the left side of the frame. the bottom edge of the frame is y ≈ -1.72
+  firework: {
+    base: [0, -1.72, 0],      // flower-pot (anar) sits on the bottom edge
+    burstLowY: -0.7,          // burst point with hands just apart...
+    burstHighY: 2.5,          // ...and fully spread
+    maxRadius: 2.25,          // biggest burst radius. keeps it off your face
+    sparksPerSecond: 1700,    // sparkler burst at full spread
+    fountainPerSecond: 520,   // golden fountain out of the pot
+    crackleChance: 0.24,      // sparks that split into little branches as they die
+    shellAt: 0.7,             // spreading past this sets off a full colour shell
+    shellRepeatSeconds: 1.4,  // keeps shelling while your arms stay wide
+    shellSparks: 440,
+    trailSeconds: 0.11,       // streak length (bigger = longer streaks)
+    brightness: 1.7,          // >1 pushes the glow harder
+    // diwali palette: gold, saffron, rani pink, emerald, cyan, violet, red
+    palette: ['#ffd23a', '#ff7a00', '#ff2d95', '#16f08a', '#2ee6ff', '#a45cff', '#ff3b30'],
+    gold: ['#ffe08a', '#ffb52e', '#ff8a1c', '#fff2c4'],
+    potColor: 0x9c3d16,       // terracotta
+  },
+
+  // the room dims while it's going off so the colours pop on a bright wall.
+  // the edges dim more than the middle, so your face stays readable
+  night: {
+    dim: 0.72,                // 0 = never dim
+    edgeBias: 0.45,           // 0 = even dim, 1 = only the edges
+  },
+
+  interaction: {
+    // distance between your palms, measured in hand-lengths so it doesn't
+    // matter how far you sit from the camera
+    spreadMin: 1.3,           // hands holding each other
+    spreadMax: 7.5,           // arms wide
+    riseSeconds: 0.07,        // how fast it follows your hands opening
+    fallSeconds: 0.2,         // ...and closing
+    releaseSeconds: 0.6,      // lose a hand for this long and it dies down
+  },
+
+  // D switches to an automatic cycle, for framing a shot without hands
+  autoCycleSeconds: 8,
+
+  glow: {                     // UnrealBloom on the firework only
+    strength: 0.95,
+    radius: 0.42,
+    threshold: 0.3,
+  },
+
+  view: {
+    fov: 45,
+    position: [0, 1.8, 8.5],
+    lookAt: [0, 1.8, 0],
+    // horizontal screen shift as a fraction of the window width.
+    // negative parks the firework on the left so your face stays clear.
+    // left/right arrow keys adjust it live (remembered), 0 = centered
+    screenShift: -0.26,
+  },
+
+  // "Happy Diwali" + your handle, right of your face, when your arms open
+  title: {
+    happy: 'Happy',
+    diwali: 'Diwali',
+    handle: '@quant_kavin',
+    showAt: 0.55,             // spark value that brings it in...
+    hideAt: 0.3,              // ...and the value that takes it away
+    x: 0.8,                   // centre of the block, fraction of the screen
+    y: 0.3,
+    size: 0.17,               // "Diwali" letter height, fraction of screen height
+    maxWidth: 0.3,            // never wider than this fraction of the screen
+    revealSeconds: 1.1,
+  },
+
+  overlay: {
+    lineColor: '#ffffff',
+    lineWidth: 2,
+    dotRadius: 6,
+    font: '500 22px system-ui, -apple-system, sans-serif',
+  },
+
+  // webcam. the browser falls back to whatever the camera can do if it
+  // can't hit these, and the actual mode is shown when the feed starts
+  feed: {
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    sharpen: 0,
+    contrast: 1.0,
+    saturation: 1.0,
+    preferExternal: true,     // skip the laptop's built-in cam when a USB one is plugged in
+  },
+};
+
+function spreadStageName(spread) {
+  if (spread < 0.04) return 'lit, waiting';
+  if (spread < 0.3) return 'fuse burning';
+  if (spread < PARAMS.firework.shellAt) return 'sparkler';
+  return 'shells going off';
+}
+
+
+const stage = createStage({
+  canvas: document.getElementById('stage'),
+  view: PARAMS.view,
+  glow: PARAMS.glow,
+  look: { ...PARAMS.feed, edgeBias: PARAMS.night.edgeBias, additive: true },
+  shiftStorageKey: 'arcam.diwali.shift',
+});
+const firework = createFirework({ scene: stage.scene, renderer: stage.renderer, settings: PARAMS.firework });
+const textCanvas = document.getElementById('text');
+const title = createTitle(textCanvas, PARAMS.title);
+document.fonts?.load('80px "Diwali Script"');
+document.fonts?.load('700 80px "Diwali Display"');
+
+/* ---- hands -> spark ---------------------------------------------------- */
+
+// middle of the palm: wrist and the four knuckles averaged
+function palm(hand, aspect = 1) {
+  const points = [0, 5, 9, 13, 17].map((i) => hand[i]);
+  return {
+    x: (points.reduce((sum, p) => sum + p.x, 0) / points.length) * aspect,
+    y: points.reduce((sum, p) => sum + p.y, 0) / points.length,
+  };
+}
+
+// gap between the palms in hand-lengths, so sitting closer or further
+// from the camera doesn't change the result. 0 = clasped, 1 = arms wide
+function sparkFromHands(a, b, aspect) {
+  const pa = palm(a, aspect), pb = palm(b, aspect);
+  const gap = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+  const size = (handLength(a, aspect) + handLength(b, aspect)) / 2;
+  if (size < 1e-5) return 0;
+  const { spreadMin, spreadMax } = PARAMS.interaction;
+  return THREE.MathUtils.clamp((gap / size - spreadMin) / (spreadMax - spreadMin), 0, 1);
+}
+
+const handCanvas = document.getElementById('hands');
+const pen = handCanvas.getContext('2d');
+let showBones = false;
+let handSpark = 0;
+let bothHandsAt = -Infinity;
+
+function onHands({ hands }, time) {
+  const ratio = fitToWindow(handCanvas);
+  pen.clearRect(0, 0, handCanvas.width, handCanvas.height);
+  const pair = hands.slice(0, 2);
+  if (pair.length === 2) {
+    const video = document.querySelector('video.source');
+    handSpark = sparkFromHands(pair[0], pair[1], video.videoWidth / video.videoHeight);
+    bothHandsAt = time;
+  }
+  if (!pair.length) return;
+
+  const look = PARAMS.overlay;
+  const toScreen = screenMapper(handCanvas, stage.coverScale);
+  pen.strokeStyle = pen.fillStyle = look.lineColor;
+  pen.lineCap = 'round';
+  if (showBones) drawBones(pen, pair, toScreen, 1.5 * ratio);
+  const palms = pair.map((hand) => toScreen(palm(hand)));
+  if (palms.length === 2) {
+    pen.lineWidth = look.lineWidth * ratio;
+    pen.beginPath();
+    pen.moveTo(...palms[0]);
+    pen.lineTo(...palms[1]);
+    pen.stroke();
+    drawLabel(pen, `spark ${handSpark.toFixed(2)}`,
+      (palms[0][0] + palms[1][0]) / 2, Math.min(palms[0][1], palms[1][1]) - 18 * ratio,
+      { font: look.font, ratio });
+  }
+  for (const [x, y] of palms) {
+    pen.beginPath();
+    pen.arc(x, y, look.dotRadius * ratio, 0, Math.PI * 2);
+    pen.fill();
+  }
+}
+
+/* ---- loop ------------------------------------------------------------- */
+
+let autoCycle = false;
+let pinned = null;     // 0..1 holds the auto cycle at one value
+let spark = 0;
+
+function onFrame(dt, time) {
+  let target;
+  if (autoCycle) {
+    target = pinned ?? 0.5 - 0.5 * Math.cos((time / PARAMS.autoCycleSeconds) * Math.PI * 2);
+  } else {
+    target = time - bothHandsAt < PARAMS.interaction.releaseSeconds ? handSpark : 0;
+  }
+  // opens quickly, settles back a little slower
+  spark = follow(spark, target, dt,
+    target > spark ? PARAMS.interaction.riseSeconds : PARAMS.interaction.fallSeconds);
+
+  firework.update(dt, time, spark);
+  const t = THREE.MathUtils.clamp(spark / 0.6, 0, 1);
+  stage.uniforms.night.value = PARAMS.night.dim * t * t * (3 - 2 * t);
+  title.update(dt, time, spark);
+}
+
+runCam({
+  stage,
+  feed: PARAMS.feed,
+  recordLayers: [stage.renderer.domElement, textCanvas, handCanvas],
+  filePrefix: 'diwali',
+  onHands,
+  onFrame,
+  keys: {
+    d: () => { autoCycle = !autoCycle; },
+    1: () => { autoCycle = true; pinned = 0; },
+    2: () => { autoCycle = true; pinned = 0.5; },
+    3: () => { autoCycle = true; pinned = 1; },
+    0: () => { pinned = null; },
+    s: () => { showBones = !showBones; },
+  },
+  status: () => [
+    `mode: ${autoCycle ? (pinned === null ? 'auto cycle' : 'auto (pinned)') : 'live hands'}   [D] auto  [1/2/3] pin  [0] cycle  [S] skeleton`,
+    `spark: ${spark.toFixed(2)}  ${spreadStageName(spark)}   particles: ${firework.sparkCount}`,
+  ],
+});
+
+window.PARAMS = PARAMS;   // tweak live from the browser console
+</script>
+</body>
+</html>

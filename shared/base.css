@@ -1,0 +1,82 @@
+/* layout shared by both cams: one WebGL stage, 2D layers on top */
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+}
+
+/* the <video> is only a texture source, the stage draws it */
+.source {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 2px;
+  height: 2px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.layer {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+}
+#stage { z-index: 1; pointer-events: auto; cursor: grab; }
+#text { z-index: 2; }
+#hands { z-index: 3; }
+
+.badge {
+  position: absolute;
+  top: 14px;
+  z-index: 4;
+  color: #fff;
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  border-radius: 8px;
+  padding: 7px 11px;
+  pointer-events: none;
+}
+#toast {
+  left: 16px;
+  background: rgba(0, 0, 0, .55);
+  opacity: 0;
+  transition: opacity .4s;
+}
+#rec {
+  right: 16px;
+  display: none;
+  font-weight: 600;
+  background: rgba(220, 20, 40, .85);
+  border-radius: 14px;
+}
+
+#status {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  z-index: 4;
+  display: none;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .7);
+  color: #ffd27a;
+  font: 12px/1.6 ui-monospace, Consolas, monospace;
+  white-space: pre;
+  pointer-events: none;
+}
+
+#hint {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font: 15px/1.5 system-ui, sans-serif;
+  text-align: center;
+  pointer-events: none;
+}

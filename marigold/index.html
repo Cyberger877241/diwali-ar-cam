@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marigold Cam</title>
+<link rel="stylesheet" href="../shared/base.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<video class="source" autoplay muted playsinline></video>
+<canvas id="stage" class="layer"></canvas>
+<canvas id="text" class="layer"></canvas>
+<canvas id="hands" class="layer"></canvas>
+<div id="toast" class="badge"></div>
+<div id="rec" class="badge">● REC</div>
+<pre id="status"></pre>
+<div id="hint">waiting for camera…<br>allow access when the browser asks</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { createStage } from '../shared/stage.js';
+import { runCam, follow } from '../shared/app.js';
+import { fitToWindow, screenMapper, drawBones, drawLabel, distance, handLength } from '../shared/hands.js';
+import { createBush } from './bush.js';
+
+// everything worth tweaking lives here
+const PARAMS = {
+
+  // the clump: every stem starts near the same base point and ends at a tip.
+  // tips are world units, the base sits at y = -1.75 (bottom of the frame)
+  bush: {
+    seed: 11,                 // change for a different leaf / petal layout
+    tips: [
+      [-0.2, 2.35, -0.25],    // tallest, center back
+      [-1.05, 1.65, 0.35],
+      [0.75, 1.95, 0.3],
+      [1.35, 0.95, -0.1],
+      [-1.65, 0.45, 0.15],    // low one off to the side, like the reference
+    ],
+    stemColor: 0x3d8b37,
+    stemRadius: 0.034,
+    growStagger: 0.07,        // each stem starts this much later than the last
+  },
+
+  leaves: {
+    perStem: 10,              // feathery leaves along each stem
+    atBase: 11,               // extra ones fanning out from the bottom
+    length: 1.15,
+    leafletPairs: 7,          // marigold leaves are pinnate: pairs of thin
+                              // serrated leaflets along a midrib
+    colorDark: 0x1f5e25,
+    colorLight: 0x5aa84a,
+    glowColor: 0x0a260c,      // faint self-light so they don't go muddy on video
+  },
+
+  heads: {
+    radius: 0.44,             // size of a full pompom
+    petals: 300,              // per head. more = denser, heavier
+    colorDeep: 0xa82604,      // petal base / center of the ball
+    colorBright: 0xff9a12,    // ruffled petal edges
+    glowColor: 0xff5200,
+    glow: 0.2,               // emissive strength, feeds the bloom glow
+    maxPolarDeg: 128,         // how far round the ball the petals go
+    calyxColor: 0x3f8a36,     // the green cup under each flower
+    bloomStagger: 0.12,       // 0 = all heads open together
+  },
+
+  // pinch = gap between thumb tip and index tip, divided by the hand's own
+  // length (wrist to middle knuckle) so distance from the camera doesn't matter
+  pinch: {
+    closed: 0.35,             // ratio when the fingertips touch
+    open: 1.5,                // ratio with thumb and index spread wide
+    growMaxAt: 0.75,          // grow is already 100% at this much pinch
+    lagSeconds: 0.09,         // smoothing against tracking jitter
+    swapHands: false,         // flip if grow and bloom land on the wrong hands
+  },
+
+  // D switches to an automatic bloom cycle, for framing a shot without hands
+  autoCycleSeconds: 9,
+
+  glow: {                     // UnrealBloom, only applied to the plant
+    strength: 0.85,
+    radius: 0.5,
+    threshold: 0.18,
+  },
+
+  view: {
+    fov: 45,
+    position: [0, 1.8, 8.5],
+    lookAt: [0, 1.8, 0],
+    // horizontal screen shift as a fraction of the window width.
+    // negative parks the bush on the left half so your face stays clear.
+    // left/right arrow keys adjust it live (remembered), 0 = centered
+    screenShift: -0.26,
+  },
+
+  overlay: {
+    lineColor: '#ffffff',
+    lineWidth: 2,
+    dotRadius: 5,
+    font: '500 22px system-ui, -apple-system, sans-serif',
+  },
+
+  // webcam. the browser falls back to whatever the camera can do if it
+  // can't hit these, and the actual mode is shown when the feed starts
+  feed: {
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    // 1 / 1 / 0 = exactly what the webcam sends. nudge these if you want a graded look
+    sharpen: 0,               // try 0.15-0.3 for a crisper edge
+    contrast: 1.0,
+    saturation: 1.0,
+    preferExternal: true,     // skip the laptop's built-in cam when a USB one is plugged in
+  },
+};
+
+function stageName(bloomAmount) {
+  if (bloomAmount < 0.08) return 'closed buds';
+  if (bloomAmount < 0.4) return 'outer petals opening';
+  if (bloomAmount < 0.8) return 'filling in';
+  return 'full pompoms';
+}
+
+
+const stage = createStage({
+  canvas: document.getElementById('stage'),
+  view: PARAMS.view,
+  glow: PARAMS.glow,
+  look: PARAMS.feed,
+  shiftStorageKey: 'arcam.marigold.shift',
+});
+const bush = createBush({ scene: stage.scene, settings: PARAMS });
+
+/* ---- hands -> grow / bloom ------------------------------------------- */
+
+// 0 = fingertips touching, 1 = spread wide
+function pinchAmount(hand) {
+  const ratio = distance(hand[4], hand[8]) / Math.max(handLength(hand), 1e-5);
+  const { closed, open } = PARAMS.pinch;
+  return THREE.MathUtils.clamp((ratio - closed) / (open - closed), 0, 1);
+}
+
+// MediaPipe names hands as if the image were a mirror. we give it the raw
+// camera image, so its "Right" is the user's own left hand
+function isUsersLeft(label) {
+  return (label === 'Right') !== PARAMS.pinch.swapHands;
+}
+
+const handCanvas = document.getElementById('hands');
+const pen = handCanvas.getContext('2d');
+let showBones = false;
+const fromHands = { grow: 0, bloom: 0 };
+
+function onHands({ hands, labels }) {
+  const ratio = fitToWindow(handCanvas);
+  pen.clearRect(0, 0, handCanvas.width, handCanvas.height);
+  if (!hands.length) return;
+
+  const look = PARAMS.overlay;
+  const toScreen = screenMapper(handCanvas, stage.coverScale);
+  pen.strokeStyle = pen.fillStyle = look.lineColor;
+  pen.lineCap = 'round';
+  if (showBones) drawBones(pen, hands, toScreen, 1.5 * ratio);
+
+  hands.forEach((hand, i) => {
+    const role = isUsersLeft(labels[i]) ? 'grow' : 'bloom';
+    const amount = pinchAmount(hand);
+    fromHands[role] = amount;
+
+    const thumb = toScreen(hand[4]);
+    const index = toScreen(hand[8]);
+    pen.lineWidth = look.lineWidth * ratio;
+    pen.beginPath();
+    pen.moveTo(...thumb);
+    pen.lineTo(...index);
+    pen.stroke();
+    for (const [x, y] of [thumb, index]) {
+      pen.beginPath();
+      pen.arc(x, y, look.dotRadius * ratio, 0, Math.PI * 2);
+      pen.fill();
+    }
+    // label on the outside of the pinch, level with the higher fingertip
+    const leftSide = (thumb[0] + index[0]) / 2 < handCanvas.width / 2;
+    const gap = 14 * ratio;
+    drawLabel(pen, `${role} ${amount.toFixed(2)}`,
+      leftSide ? Math.min(thumb[0], index[0]) - gap : Math.max(thumb[0], index[0]) + gap,
+      Math.min(thumb[1], index[1]) + 8 * ratio,
+      { font: look.font, ratio, align: leftSide ? 'right' : 'left' });
+  });
+}
+
+/* ---- loop ------------------------------------------------------------- */
+
+let autoCycle = false;
+let pinned = null;
+const shown = { grow: 0, bloom: 0 };
+
+function onFrame(dt, time) {
+  let grow, bloom;
+  if (autoCycle) {
+    grow = 1;
+    bloom = pinned ?? 0.5 - 0.5 * Math.cos((time / PARAMS.autoCycleSeconds) * Math.PI * 2);
+  } else {
+    // a hand that leaves the frame keeps its last value
+    grow = THREE.MathUtils.clamp(fromHands.grow / PARAMS.pinch.growMaxAt, 0, 1);
+    bloom = fromHands.bloom;
+  }
+  shown.grow = follow(shown.grow, grow, dt, PARAMS.pinch.lagSeconds);
+  shown.bloom = follow(shown.bloom, bloom, dt, PARAMS.pinch.lagSeconds);
+  bush.setGrowth(shown.grow);
+  bush.setBloom(shown.bloom);
+  bush.group.rotation.z = Math.sin(time * 0.3) * 0.02;   // gentle sway
+}
+
+runCam({
+  stage,
+  feed: PARAMS.feed,
+  recordLayers: [stage.renderer.domElement, handCanvas],
+  filePrefix: 'marigold',
+  onHands,
+  onFrame,
+  keys: {
+    d: () => { autoCycle = !autoCycle; },
+    1: () => { autoCycle = true; pinned = 0; },
+    2: () => { autoCycle = true; pinned = 0.45; },
+    3: () => { autoCycle = true; pinned = 1; },
+    0: () => { pinned = null; },
+    s: () => { showBones = !showBones; },
+  },
+  status: () => [
+    `mode: ${autoCycle ? (pinned === null ? 'auto cycle' : 'auto (pinned)') : 'live hands'}   [D] auto  [1/2/3] pin  [0] cycle  [S] skeleton`,
+    `grow:  ${shown.grow.toFixed(2)}  (left hand pinch)`,
+    `bloom: ${shown.bloom.toFixed(2)}  (right hand pinch, ${stageName(shown.bloom)})`,
+  ],
+});
+
+window.PARAMS = PARAMS;   // tweak live from the browser console
+</script>
+</body>
+</html>
